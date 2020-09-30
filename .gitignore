@@ -1,0 +1,6 @@
+vendor/
+google-client-id.json
+
+.env
+
+.vscode/
