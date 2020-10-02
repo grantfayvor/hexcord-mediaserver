@@ -62,6 +62,8 @@ func CreateWebRTCConnection(ingestionAddress, streamKey, offerStr string) (*webr
 		return nil, err
 	}
 
+	quit := make(chan bool)
+
 	go func() {
 		peerConnection.OnTrack(func(track *webrtc.Track, receiver *webrtc.RTPReceiver) {
 			fmt.Println("Tracks are being added my dear")
@@ -81,6 +83,7 @@ func CreateWebRTCConnection(ingestionAddress, streamKey, offerStr string) (*webr
 			fmt.Printf("Track has started, of type %d: %s \n", track.PayloadType(), track.Codec().Name)
 
 			streamURL := fmt.Sprintf("%s/%s", ingestionAddress, streamKey)
+
 			for {
 				// Read RTP packets being sent to Pion
 				rtp, readErr := track.ReadRTP()
@@ -92,12 +95,13 @@ func CreateWebRTCConnection(ingestionAddress, streamKey, offerStr string) (*webr
 				}
 				switch track.Kind() {
 				case webrtc.RTPCodecTypeAudio:
-					pushOpus(rtp, audioBuilder, audioWriter, audioTimestamp)
+					pushOpus(rtp, audioBuilder, &audioWriter, &audioTimestamp)
 				case webrtc.RTPCodecTypeVideo:
-					pushVP8(streamURL, rtp, videoBuilder, audioWriter, videoWriter, videoTimestamp)
+					pushVP8(streamURL, rtp, videoBuilder, &audioWriter, &videoWriter, &videoTimestamp)
 				}
 			}
 		})
+
 		peerConnection.OnICECandidate(func(candidate *webrtc.ICECandidate) {
 			fmt.Println(candidate)
 		})
@@ -106,9 +110,18 @@ func CreateWebRTCConnection(ingestionAddress, streamKey, offerStr string) (*webr
 		// This will notify you when the peer has connected/disconnected
 		peerConnection.OnICEConnectionStateChange(func(connectionState webrtc.ICEConnectionState) {
 			fmt.Printf("Connection State has changed %s \n", connectionState.String())
+
+			if connectionState.String() == "failed" {
+				peerConnection.Close()
+				quit <- true
+			}
 		})
 
-		select {}
+		select {
+		case <-quit:
+			fmt.Println("about to exit the goroutine ====")
+			return
+		}
 	}()
 
 	// Wait for the offer to be pasted
@@ -139,7 +152,7 @@ func CreateWebRTCConnection(ingestionAddress, streamKey, offerStr string) (*webr
 	return &answer, nil
 }
 
-func startFFmpeg(streamURL string, audioWriter, videoWriter webm.BlockWriteCloser, width, height int) {
+func startFFmpeg(streamURL string, audioWriter, videoWriter *webm.BlockWriteCloser, width, height int) {
 	// Create a ffmpeg process that consumes MKV via stdin, and broadcasts out to Twitch
 	ffmpeg := exec.Command("ffmpeg", "-re", "-i", "pipe:0", "-c:v", "libx264", "-preset", "veryfast", "-maxrate", "3000k", "-bufsize", "6000k", "-pix_fmt", "yuv420p", "-g", "50", "-c:a", "aac", "-b:a", "160k", "-ac", "2", "-ar", "44100", "-f", "flv", streamURL) //nolint
 	ffmpegIn, _ := ffmpeg.StdinPipe()
@@ -186,12 +199,12 @@ func startFFmpeg(streamURL string, audioWriter, videoWriter webm.BlockWriteClose
 	}
 
 	fmt.Printf("WebM saver has started with video width=%d, height=%d\n", width, height)
-	audioWriter = ws[0]
-	videoWriter = ws[1]
+	*audioWriter = ws[0]
+	*videoWriter = ws[1]
 }
 
 // Parse Opus audio and Write to WebM
-func pushOpus(rtpPacket *rtp.Packet, audioBuilder *samplebuilder.SampleBuilder, audioWriter webm.BlockWriteCloser, audioTimestamp uint32) {
+func pushOpus(rtpPacket *rtp.Packet, audioBuilder *samplebuilder.SampleBuilder, audioWriter *webm.BlockWriteCloser, audioTimestamp *uint32) {
 	audioBuilder.Push(rtpPacket)
 
 	for {
@@ -199,10 +212,10 @@ func pushOpus(rtpPacket *rtp.Packet, audioBuilder *samplebuilder.SampleBuilder, 
 		if sample == nil {
 			return
 		}
-		if audioWriter != nil {
-			audioTimestamp += sample.Samples
-			t := audioTimestamp / 48
-			if _, err := audioWriter.Write(true, int64(t), rtpPacket.Payload); err != nil {
+		if (*audioWriter) != nil {
+			*audioTimestamp += sample.Samples
+			t := *audioTimestamp / 48
+			if _, err := (*audioWriter).Write(true, int64(t), rtpPacket.Payload); err != nil {
 				panic(err)
 			}
 		}
@@ -210,7 +223,7 @@ func pushOpus(rtpPacket *rtp.Packet, audioBuilder *samplebuilder.SampleBuilder, 
 }
 
 // Parse VP8 video and Write to WebM
-func pushVP8(streamURL string, rtpPacket *rtp.Packet, videoBuilder *samplebuilder.SampleBuilder, audioWriter, videoWriter webm.BlockWriteCloser, videoTimestamp uint32) {
+func pushVP8(streamURL string, rtpPacket *rtp.Packet, videoBuilder *samplebuilder.SampleBuilder, audioWriter, videoWriter *webm.BlockWriteCloser, videoTimestamp *uint32) {
 	videoBuilder.Push(rtpPacket)
 
 	for {
@@ -226,15 +239,15 @@ func pushVP8(streamURL string, rtpPacket *rtp.Packet, videoBuilder *samplebuilde
 			width := int(raw & 0x3FFF)
 			height := int((raw >> 16) & 0x3FFF)
 
-			if videoWriter == nil || audioWriter == nil {
+			if (*videoWriter) == nil || (*audioWriter) == nil {
 				// Initialize WebM saver using received frame size.
 				startFFmpeg(streamURL, audioWriter, videoWriter, width, height)
 			}
 		}
-		if videoWriter != nil {
-			videoTimestamp += sample.Samples
-			t := videoTimestamp / 90
-			if _, err := videoWriter.Write(videoKeyframe, int64(t), sample.Data); err != nil {
+		if (*videoWriter) != nil {
+			*videoTimestamp += sample.Samples
+			t := *videoTimestamp / 90
+			if _, err := (*videoWriter).Write(videoKeyframe, int64(t), sample.Data); err != nil {
 				panic(err)
 			}
 		}
