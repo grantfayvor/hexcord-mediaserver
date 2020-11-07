@@ -2,106 +2,142 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
-	"io"
+	"net"
 	"os/exec"
 	"time"
 
-	"github.com/at-wat/ebml-go/webm"
 	"github.com/pion/rtcp"
-	"github.com/pion/rtp"
-	"github.com/pion/rtp/codecs"
 	"github.com/pion/webrtc/v3"
-	"github.com/pion/webrtc/v3/pkg/media/samplebuilder"
 )
 
-//CreateWebRTCConnection function to create webrtc connection and return answer
-func CreateWebRTCConnection(ingestionAddress, streamKey, offerStr string) (*webrtc.SessionDescription, error) {
-	var (
-		audioWriter, videoWriter       webm.BlockWriteCloser
-		audioBuilder, videoBuilder     *samplebuilder.SampleBuilder
-		audioTimestamp, videoTimestamp uint32
-	)
+type udpConn struct {
+	conn *net.UDPConn
+	port int
+}
 
-	// Prepare the configuration
-	config := webrtc.Configuration{
-		ICEServers: []webrtc.ICEServer{
-			{
-				URLs: []string{
-					"stun:stun.l.google.com:19302",
-				},
-			},
-		},
-	}
+// CreateWebRTCConnection function
+func CreateWebRTCConnection(ingestionAddress, streamKey, offerStr string) (answer webrtc.SessionDescription, err error) {
+
+	defer func() {
+		if err := recover(); err != nil {
+			// cancel()
+		}
+	}()
 
 	// Create a MediaEngine object to configure the supported codec
 	m := webrtc.MediaEngine{}
 
 	// Setup the codecs you want to use.
-	// Only support VP8 and OPUS, this makes our WebM muxer code simpler
-	m.RegisterCodec(webrtc.NewRTPVP8Codec(webrtc.DefaultPayloadTypeVP8, 90000))
 	m.RegisterCodec(webrtc.NewRTPOpusCodec(webrtc.DefaultPayloadTypeOpus, 48000))
-
-	audioBuilder = samplebuilder.New(10, &codecs.OpusPacket{})
-	videoBuilder = samplebuilder.New(10, &codecs.VP8Packet{})
+	m.RegisterCodec(webrtc.NewRTPH264Codec(webrtc.DefaultPayloadTypeH264, 90000))
 
 	// Create the API object with the MediaEngine
 	api := webrtc.NewAPI(webrtc.WithMediaEngine(m))
 
+	// Everything below is the Pion WebRTC API! Thanks for using it ❤️.
+
+	// Prepare the configuration
+	config := webrtc.Configuration{
+		ICEServers: []webrtc.ICEServer{
+			{
+				URLs: []string{"stun:stun.l.google.com:19302"},
+			},
+		},
+	}
+
 	// Create a new RTCPeerConnection
 	peerConnection, err := api.NewPeerConnection(config)
 	if err != nil {
-		return nil, err
+		panic(err)
 	}
 
-	// Allow us to receive 1 audio track, and 2 video tracks
+	// Allow us to receive 1 audio track, and 1 video track
 	if _, err = peerConnection.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio); err != nil {
-		return nil, err
+		panic(err)
 	} else if _, err = peerConnection.AddTransceiverFromKind(webrtc.RTPCodecTypeVideo); err != nil {
-		return nil, err
+		panic(err)
 	}
 
-	quit := make(chan bool)
+	go func(peerConnection *webrtc.PeerConnection) {
+		// Create context
+		ctx, cancel := context.WithCancel(context.Background())
 
-	go func() {
+		// Create a local addr
+		var laddr *net.UDPAddr
+		if laddr, err = net.ResolveUDPAddr("udp", "127.0.0.1:"); err != nil {
+			fmt.Println(err)
+			cancel()
+		}
+
+		// Prepare udp conns
+		udpConns := map[string]*udpConn{
+			"audio": {port: 4000},
+			"video": {port: 4002},
+		}
+		for _, c := range udpConns {
+			// Create remote addr
+			var raddr *net.UDPAddr
+			if raddr, err = net.ResolveUDPAddr("udp", fmt.Sprintf("127.0.0.1:%d", c.port)); err != nil {
+				fmt.Println(err)
+				cancel()
+			}
+
+			// Dial udp
+			if c.conn, err = net.DialUDP("udp", laddr, raddr); err != nil {
+				fmt.Println(err)
+				cancel()
+			}
+			defer func(conn net.PacketConn) {
+				if closeErr := conn.Close(); closeErr != nil {
+					fmt.Println(closeErr)
+				}
+			}(c.conn)
+		}
+
+		streamURL := fmt.Sprintf("%s/%s", ingestionAddress, streamKey)
+		startFFmpeg(streamURL)
+
+		// Set a handler for when a new remote track starts, this handler will forward data to
+		// our UDP listeners.
+		// In your application this is where you would handle/process audio/video
 		peerConnection.OnTrack(func(track *webrtc.Track, receiver *webrtc.RTPReceiver) {
-			fmt.Println("Tracks are being added my dear")
+			fmt.Println("on track called")
+
+			// Retrieve udp connection
+			c, ok := udpConns[track.Kind().String()]
+			if !ok {
+				return
+			}
 
 			// Send a PLI on an interval so that the publisher is pushing a keyframe every rtcpPLIInterval
-			// This is a temporary fix until we implement incoming RTCP events, then we would push a PLI only when a viewer requests it
 			go func() {
-				ticker := time.NewTicker(time.Second * 3)
+				ticker := time.NewTicker(time.Second * 2)
 				for range ticker.C {
-					rtcpSendErr := peerConnection.WriteRTCP([]rtcp.Packet{&rtcp.PictureLossIndication{MediaSSRC: track.SSRC()}})
-					if rtcpSendErr != nil {
-						fmt.Println(rtcpSendErr)
+					if rtcpErr := peerConnection.WriteRTCP([]rtcp.Packet{&rtcp.PictureLossIndication{MediaSSRC: track.SSRC()}}); rtcpErr != nil {
+						fmt.Println(rtcpErr)
 					}
 				}
 			}()
 
-			fmt.Printf("Track has started, of type %d: %s \n", track.PayloadType(), track.Codec().Name)
-
-			streamURL := fmt.Sprintf("%s/%s", ingestionAddress, streamKey)
-
+			b := make([]byte, 1500)
 			for {
-				// Read RTP packets being sent to Pion
-				rtp, readErr := track.ReadRTP()
+				// Read
+				n, readErr := track.Read(b)
 				if readErr != nil {
-					if readErr == io.EOF {
-						return
-					}
-					panic(readErr)
+					fmt.Println(readErr)
 				}
-				switch track.Kind() {
-				case webrtc.RTPCodecTypeAudio:
-					pushOpus(rtp, audioBuilder, &audioWriter, &audioTimestamp)
-				case webrtc.RTPCodecTypeVideo:
-					pushVP8(streamURL, rtp, videoBuilder, &audioWriter, &videoWriter, &videoTimestamp)
+
+				// Write
+				if _, err = c.conn.Write(b[:n]); err != nil {
+					fmt.Println(err)
 				}
 			}
 		})
 
+		// in a production application you should exchange ICE Candidates via OnICECandidate
 		peerConnection.OnICECandidate(func(candidate *webrtc.ICECandidate) {
 			fmt.Println(candidate)
 		})
@@ -111,51 +147,50 @@ func CreateWebRTCConnection(ingestionAddress, streamKey, offerStr string) (*webr
 		peerConnection.OnICEConnectionStateChange(func(connectionState webrtc.ICEConnectionState) {
 			fmt.Printf("Connection State has changed %s \n", connectionState.String())
 
-			if connectionState.String() == "failed" {
-				peerConnection.Close()
-				quit <- true
+			if connectionState == webrtc.ICEConnectionStateConnected {
+				fmt.Println("ICE connection was successful")
+			} else if connectionState == webrtc.ICEConnectionStateFailed ||
+				connectionState == webrtc.ICEConnectionStateDisconnected {
+				cancel()
 			}
 		})
 
-		select {
-		case <-quit:
-			fmt.Println("about to exit the goroutine ====")
-			return
-		}
-	}()
+		// Wait for context to be done
+		<-ctx.Done()
+		peerConnection.Close()
+
+	}(peerConnection)
 
 	// Wait for the offer to be pasted
 	offer := webrtc.SessionDescription{}
 	err = json.Unmarshal([]byte(offerStr), &offer)
 	if err != nil {
-		return nil, err
+		panic(err)
 	}
 
 	// Set the remote SessionDescription
-	err = peerConnection.SetRemoteDescription(offer)
-	if err != nil {
-		return nil, err
+	if err = peerConnection.SetRemoteDescription(offer); err != nil {
+		panic(err)
 	}
 
-	// Create an answer
-	answer, err := peerConnection.CreateAnswer(nil)
+	// Create answer
+	answer, err = peerConnection.CreateAnswer(nil)
 	if err != nil {
-		return nil, err
+		panic(err)
 	}
 
 	// Sets the LocalDescription, and starts our UDP listeners
-	err = peerConnection.SetLocalDescription(answer)
-	if err != nil {
-		return nil, err
+	if err = peerConnection.SetLocalDescription(answer); err != nil {
+		panic(err)
 	}
 
-	return &answer, nil
+	return
 }
 
-func startFFmpeg(streamURL string, audioWriter, videoWriter *webm.BlockWriteCloser, width, height int) {
-	// Create a ffmpeg process that consumes MKV via stdin, and broadcasts out to Twitch
-	ffmpeg := exec.Command("ffmpeg", "-re", "-i", "pipe:0", "-c:v", "libx264", "-preset", "veryfast", "-maxrate", "3000k", "-bufsize", "6000k", "-pix_fmt", "yuv420p", "-g", "50", "-c:a", "aac", "-b:a", "160k", "-ac", "2", "-ar", "44100", "-f", "flv", streamURL) //nolint
-	ffmpegIn, _ := ffmpeg.StdinPipe()
+func startFFmpeg(streamURL string) {
+	// Create a ffmpeg process that consumes MKV via stdin, and broadcasts out to Stream URL
+	ffmpeg := exec.Command("ffmpeg", "-protocol_whitelist", "file,udp,rtp", "-i", "rtp-forwarder.sdp", "-c:v", "copy", "-c:a", "aac", "-f", "flv", "-strict", "-2", streamURL) //nolint
+	ffmpeg.StdinPipe()
 	ffmpegOut, _ := ffmpeg.StderrPipe()
 	if err := ffmpeg.Start(); err != nil {
 		panic(err)
@@ -167,89 +202,4 @@ func startFFmpeg(streamURL string, audioWriter, videoWriter *webm.BlockWriteClos
 			fmt.Println(scanner.Text())
 		}
 	}()
-
-	ws, err := webm.NewSimpleBlockWriter(ffmpegIn,
-		[]webm.TrackEntry{
-			{
-				Name:            "Audio",
-				TrackNumber:     1,
-				TrackUID:        12345,
-				CodecID:         "A_OPUS",
-				TrackType:       2,
-				DefaultDuration: 20000000,
-				Audio: &webm.Audio{
-					SamplingFrequency: 48000.0,
-					Channels:          2,
-				},
-			}, {
-				Name:            "Video",
-				TrackNumber:     2,
-				TrackUID:        67890,
-				CodecID:         "V_VP8",
-				TrackType:       1,
-				DefaultDuration: 33333333,
-				Video: &webm.Video{
-					PixelWidth:  uint64(width),
-					PixelHeight: uint64(height),
-				},
-			},
-		})
-	if err != nil {
-		panic(err)
-	}
-
-	fmt.Printf("WebM saver has started with video width=%d, height=%d\n", width, height)
-	*audioWriter = ws[0]
-	*videoWriter = ws[1]
-}
-
-// Parse Opus audio and Write to WebM
-func pushOpus(rtpPacket *rtp.Packet, audioBuilder *samplebuilder.SampleBuilder, audioWriter *webm.BlockWriteCloser, audioTimestamp *uint32) {
-	audioBuilder.Push(rtpPacket)
-
-	for {
-		sample := audioBuilder.Pop()
-		if sample == nil {
-			return
-		}
-		if (*audioWriter) != nil {
-			*audioTimestamp += sample.Samples
-			t := *audioTimestamp / 48
-			if _, err := (*audioWriter).Write(true, int64(t), rtpPacket.Payload); err != nil {
-				panic(err)
-			}
-		}
-	}
-}
-
-// Parse VP8 video and Write to WebM
-func pushVP8(streamURL string, rtpPacket *rtp.Packet, videoBuilder *samplebuilder.SampleBuilder, audioWriter, videoWriter *webm.BlockWriteCloser, videoTimestamp *uint32) {
-	videoBuilder.Push(rtpPacket)
-
-	for {
-		sample := videoBuilder.Pop()
-		if sample == nil {
-			return
-		}
-		// Read VP8 header.
-		videoKeyframe := (sample.Data[0]&0x1 == 0)
-		if videoKeyframe {
-			// Keyframe has frame information.
-			raw := uint(sample.Data[6]) | uint(sample.Data[7])<<8 | uint(sample.Data[8])<<16 | uint(sample.Data[9])<<24
-			width := int(raw & 0x3FFF)
-			height := int((raw >> 16) & 0x3FFF)
-
-			if (*videoWriter) == nil || (*audioWriter) == nil {
-				// Initialize WebM saver using received frame size.
-				startFFmpeg(streamURL, audioWriter, videoWriter, width, height)
-			}
-		}
-		if (*videoWriter) != nil {
-			*videoTimestamp += sample.Samples
-			t := *videoTimestamp / 90
-			if _, err := (*videoWriter).Write(videoKeyframe, int64(t), sample.Data); err != nil {
-				panic(err)
-			}
-		}
-	}
 }
