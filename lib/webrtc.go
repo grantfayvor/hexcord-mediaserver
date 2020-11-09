@@ -22,9 +22,7 @@ type udpConn struct {
 func CreateWebRTCConnection(ingestionAddress, streamKey, offerStr string) (answer webrtc.SessionDescription, err error) {
 
 	defer func() {
-		if err := recover(); err != nil {
-			// cancel()
-		}
+		err = recover().(error)
 	}()
 
 	// Create a MediaEngine object to configure the supported codec
@@ -98,7 +96,7 @@ func CreateWebRTCConnection(ingestionAddress, streamKey, offerStr string) (answe
 		}
 
 		streamURL := fmt.Sprintf("%s/%s", ingestionAddress, streamKey)
-		startFFmpeg(streamURL)
+		startFFmpeg(ctx, streamURL)
 
 		// Set a handler for when a new remote track starts, this handler will forward data to
 		// our UDP listeners.
@@ -187,9 +185,9 @@ func CreateWebRTCConnection(ingestionAddress, streamKey, offerStr string) (answe
 	return
 }
 
-func startFFmpeg(streamURL string) {
+func startFFmpeg(ctx context.Context, streamURL string) {
 	// Create a ffmpeg process that consumes MKV via stdin, and broadcasts out to Stream URL
-	ffmpeg := exec.Command("ffmpeg", "-protocol_whitelist", "file,udp,rtp", "-i", "rtp-forwarder.sdp", "-c:v", "copy", "-c:a", "aac", "-f", "flv", "-strict", "-2", streamURL) //nolint
+	ffmpeg := exec.CommandContext(ctx, "ffmpeg", "-protocol_whitelist", "file,udp,rtp", "-i", "rtp-forwarder.sdp", "-c:v", "copy", "-c:a", "aac", "-f", "flv", "-strict", "-2", streamURL) //nolint
 	ffmpeg.StdinPipe()
 	ffmpegOut, _ := ffmpeg.StderrPipe()
 	if err := ffmpeg.Start(); err != nil {
