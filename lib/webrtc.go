@@ -22,7 +22,9 @@ type udpConn struct {
 func CreateWebRTCConnection(ingestionAddress, streamKey, offerStr string) (answer webrtc.SessionDescription, err error) {
 
 	defer func() {
-		err = recover().(error)
+		if e, ok := recover().(error); ok {
+			err = e
+		}
 	}()
 
 	// Create a MediaEngine object to configure the supported codec
