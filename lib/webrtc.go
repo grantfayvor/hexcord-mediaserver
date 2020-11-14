@@ -104,7 +104,6 @@ func CreateWebRTCConnection(ingestionAddress, streamKey, offerStr string) (answe
 		// our UDP listeners.
 		// In your application this is where you would handle/process audio/video
 		peerConnection.OnTrack(func(track *webrtc.Track, receiver *webrtc.RTPReceiver) {
-			fmt.Println("on track called")
 
 			// Retrieve udp connection
 			c, ok := udpConns[track.Kind().String()]
@@ -118,6 +117,9 @@ func CreateWebRTCConnection(ingestionAddress, streamKey, offerStr string) (answe
 				for range ticker.C {
 					if rtcpErr := peerConnection.WriteRTCP([]rtcp.Packet{&rtcp.PictureLossIndication{MediaSSRC: track.SSRC()}}); rtcpErr != nil {
 						fmt.Println(rtcpErr)
+					}
+					if ctx.Err() == context.Canceled {
+						break
 					}
 				}
 			}()
@@ -133,6 +135,9 @@ func CreateWebRTCConnection(ingestionAddress, streamKey, offerStr string) (answe
 				// Write
 				if _, err = c.conn.Write(b[:n]); err != nil {
 					fmt.Println(err)
+					if ctx.Err() == context.Canceled {
+						break
+					}
 				}
 			}
 		})
@@ -200,6 +205,9 @@ func startFFmpeg(ctx context.Context, streamURL string) {
 		scanner := bufio.NewScanner(ffmpegOut)
 		for scanner.Scan() {
 			fmt.Println(scanner.Text())
+			if ctx.Err() == context.Canceled {
+				break
+			}
 		}
 	}()
 }
