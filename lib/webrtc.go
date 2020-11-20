@@ -4,9 +4,15 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/ioutil"
+	"math/rand"
 	"net"
+	"os"
 	"os/exec"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/pion/rtcp"
@@ -16,6 +22,25 @@ import (
 type udpConn struct {
 	conn *net.UDPConn
 	port int
+}
+
+var udpAudioPortRange = [2]int{6000, 6999}
+var udpVideoPortRange = [2]int{7000, 7999}
+var takenAudioPorts = make(map[int]bool)
+var takenVideoPorts = make(map[int]bool)
+
+var randomizer *rand.Rand = rand.New(rand.NewSource(time.Now().UnixNano()))
+
+func generateDynamicPort(possibleRange [2]int, takenPorts map[int]bool) (int, bool) {
+	if len(takenPorts) >= 1000 {
+		return 0, false
+	}
+
+	port := randomizer.Intn(possibleRange[1]-possibleRange[0]+1) + possibleRange[0]
+	if takenPorts[port] {
+		return generateDynamicPort(possibleRange, takenPorts)
+	}
+	return port, true
 }
 
 // CreateWebRTCConnection function
@@ -48,6 +73,16 @@ func CreateWebRTCConnection(ingestionAddress, streamKey, offerStr string) (answe
 		},
 	}
 
+	audioPort, ok := generateDynamicPort(udpAudioPortRange, takenAudioPorts)
+	if !ok {
+		panic(errors.New("cannot handle new sessions at this moment"))
+	}
+
+	videoPort, ok := generateDynamicPort(udpVideoPortRange, takenVideoPorts)
+	if !ok {
+		panic(errors.New("cannot handle new sessions at this moment"))
+	}
+
 	// Create a new RTCPeerConnection
 	peerConnection, err := api.NewPeerConnection(config)
 	if err != nil {
@@ -74,10 +109,10 @@ func CreateWebRTCConnection(ingestionAddress, streamKey, offerStr string) (answe
 
 		// Prepare udp conns
 		udpConns := map[string]*udpConn{
-			"audio": {port: 4000},
-			"video": {port: 4002},
+			"audio": {port: audioPort},
+			"video": {port: videoPort},
 		}
-		for _, c := range udpConns {
+		for key, c := range udpConns {
 			// Create remote addr
 			var raddr *net.UDPAddr
 			if raddr, err = net.ResolveUDPAddr("udp", fmt.Sprintf("127.0.0.1:%d", c.port)); err != nil {
@@ -90,15 +125,30 @@ func CreateWebRTCConnection(ingestionAddress, streamKey, offerStr string) (answe
 				fmt.Println(err)
 				cancel()
 			}
-			defer func(conn net.PacketConn) {
+
+			switch key {
+			case "audio":
+				takenAudioPorts[c.port] = true
+			case "video":
+				takenVideoPorts[c.port] = true
+			}
+
+			defer func(conn net.PacketConn, key string, port int) {
 				if closeErr := conn.Close(); closeErr != nil {
 					fmt.Println(closeErr)
 				}
-			}(c.conn)
+
+				switch key {
+				case "audio":
+					delete(takenAudioPorts, port)
+				case "video":
+					delete(takenVideoPorts, port)
+				}
+			}(c.conn, key, c.port)
 		}
 
 		streamURL := fmt.Sprintf("%s/%s", ingestionAddress, streamKey)
-		startFFmpeg(ctx, streamURL)
+		startFFmpeg(ctx, streamURL, strconv.Itoa(audioPort), strconv.Itoa(videoPort))
 
 		// Set a handler for when a new remote track starts, this handler will forward data to
 		// our UDP listeners.
@@ -192,9 +242,22 @@ func CreateWebRTCConnection(ingestionAddress, streamKey, offerStr string) (answe
 	return
 }
 
-func startFFmpeg(ctx context.Context, streamURL string) {
+func startFFmpeg(ctx context.Context, streamURL, audioPort, videoPort string) {
+	cwd, _ := os.Getwd()
+	sdpTemplate, err := ioutil.ReadFile(cwd + "/rtp-forwarder.sdp")
+	if err != nil {
+		panic(err)
+	}
+
+	newSDP := strings.Replace(strings.Replace(string(sdpTemplate), "{{audioPort}}", audioPort, 1), "{{videoPort}}", videoPort, 1)
+	sdpFileName := "rtp-forwarder-" + audioPort + "-" + videoPort + ".sdp"
+	err = ioutil.WriteFile(cwd+"/"+sdpFileName, []byte(newSDP), 0644)
+	if err != nil {
+		panic(err)
+	}
+
 	// Create a ffmpeg process that consumes MKV via stdin, and broadcasts out to Stream URL
-	ffmpeg := exec.CommandContext(ctx, "ffmpeg", "-protocol_whitelist", "file,udp,rtp", "-i", "rtp-forwarder.sdp", "-c:v", "copy", "-c:a", "aac", "-f", "flv", "-strict", "-2", streamURL) //nolint
+	ffmpeg := exec.CommandContext(ctx, "ffmpeg", "-protocol_whitelist", "file,udp,rtp", "-i", sdpFileName, "-c:v", "copy", "-c:a", "aac", "-f", "flv", "-strict", "-2", streamURL) //nolint
 	ffmpeg.StdinPipe()
 	ffmpegOut, _ := ffmpeg.StderrPipe()
 	if err := ffmpeg.Start(); err != nil {
@@ -209,5 +272,6 @@ func startFFmpeg(ctx context.Context, streamURL string) {
 				break
 			}
 		}
+		os.Remove(cwd + "/" + sdpFileName)
 	}()
 }
