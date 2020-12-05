@@ -5,6 +5,8 @@ import (
 	"errors"
 	"log"
 	"net/http"
+
+	"github.com/getsentry/sentry-go"
 )
 
 //OfferDescription object
@@ -24,6 +26,7 @@ func createWebRTCOffer(w http.ResponseWriter, r *http.Request) {
 	setupResponse(&w, r)
 
 	if r.URL.Path != "/webrtc/offer" {
+		sentry.CaptureException(errors.New("Route not found: " + r.URL.Path))
 		http.Error(w, "404 not found.", http.StatusNotFound)
 		return
 	}
@@ -33,6 +36,7 @@ func createWebRTCOffer(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if r.Method != "POST" {
+		sentry.CaptureException(errors.New("Method is not supported: " + r.Method))
 		http.Error(w, "Method is not supported.", http.StatusNotFound)
 		return
 	}
@@ -41,6 +45,7 @@ func createWebRTCOffer(w http.ResponseWriter, r *http.Request) {
 
 	err := DecodeJSONBody(w, r, &offerDesc)
 	if err != nil {
+		sentry.CaptureException(err)
 		var mr *malformedRequest
 		if errors.As(err, &mr) {
 			http.Error(w, mr.msg, mr.status)
@@ -54,6 +59,7 @@ func createWebRTCOffer(w http.ResponseWriter, r *http.Request) {
 	offer, err := CreateWebRTCConnection(offerDesc.IngestionAddress, offerDesc.StreamKey, offerDesc.Offer)
 
 	if err != nil {
+		sentry.CaptureException(err)
 		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 		return
 	}
