@@ -142,7 +142,8 @@ func CreateWebRTCConnection(ingestionAddress, streamKey, offerStr string) (answe
 			}
 		})
 
-		// in a production application you should exchange ICE Candidates via OnICECandidate
+		// in a production application you can either trickle ICE by exchanging ICE Candidates via OnICECandidate
+		// or disable trickle by waiting until ice gathering is complete before sending out the peerConnection answer (LocalDescription)
 		peerConnection.OnICECandidate(func(candidate *webrtc.ICECandidate) {
 			fmt.Println(candidate)
 		})
@@ -185,6 +186,8 @@ func CreateWebRTCConnection(ingestionAddress, streamKey, offerStr string) (answe
 	}
 
 	// Sets the LocalDescription, and starts our UDP listeners
+	// to disable ICE trickle don't send the local description immediately
+	// instead wait until ice gathering is complete before sending it
 	if err = peerConnection.SetLocalDescription(answer); err != nil {
 		panic(err)
 	}
